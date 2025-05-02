@@ -7,24 +7,38 @@ import qasync
 import pyqtgraph as pg
 import struct
 
+# Kod klienta WebSocket: wyłącza client-side pingi, aby uniknąć "no close frame received or sent"
+default_close_code = 1000
 
-# Klasa odpowiedzialna za odbiór danych z WebSocket
 class DataReceiver(QtCore.QObject):
-    dataReceived = QtCore.pyqtSignal(dict)  # Sygnał wysyłający odebrane dane (słownik)
+    dataReceived = QtCore.pyqtSignal(dict)
+
+    def __init__(self):
+        super().__init__()
+        self.running = True
+        self.ws = None
 
     async def run(self, uri):
-        while True:
+        """
+        Utrzymuje nieprzerwane połączenie WebSocket. Wyłącza ping_interval,
+        dzięki czemu nie czekamy na odpowiedzi ping/pong.
+        """
+        while self.running:
             try:
-                print("Próba połączenia z WebSocket...")
-                async with websockets.connect(uri) as ws:
+                print(f"Próba połączenia z {uri}...")
+                # Wyłączamy client-side pingi
+                async with websockets.connect(
+                        uri,
+                        ping_interval=None,
+                        close_timeout=5,
+                        max_size=2**20
+                    ) as ws:
+                    self.ws = ws
                     print("Połączono z ESP32 przez WebSocket!")
-                    while True:
-                        message =  await ws.recv()
-                        print(f"Odebrano wiadomość: {message}")
-                        # Oczekujemy, że długość wiadomości wynosi dokładnie 28 bajtów
+                    # Odbieraj dane w pętli
+                    async for message in ws:
                         if isinstance(message, bytes) and len(message) == 28:
                             try:
-                                # Rozpakowanie 7 floatów (little endian)
                                 v1, v2, v3, c1, c2, c3, temp = struct.unpack('<7f', message)
                                 data = {
                                     "Voltage1": v1,
@@ -40,185 +54,113 @@ class DataReceiver(QtCore.QObject):
                                 print("Błąd parsowania danych binarnych:", e)
                         else:
                             print(f"Błędna długość wiadomości: {len(message)} bajtów")
+            except websockets.exceptions.ConnectionClosedOK:
+                # Normalne zakończenie (oznaczone kodem 1000)
+                print("Połączenie zamknięte normalnie.")
+                break
             except websockets.exceptions.ConnectionClosedError as e:
-                print("Połączenie zamknięte, próbuję ponownie...", e)
-                await asyncio.sleep(1)
-            except Exception as e:
-                print("Błąd połączenia WebSocket:", e)
-                await asyncio.sleep(1)
+                # Zerwanie połączenia bez close frame -> retry
+                print("ConnectionClosedError, retrying…", e)
+            except asyncio.CancelledError:
+                print("Task anulowany, wychodzę z run().")
+                break
+            except Exception:
+                import traceback; traceback.print_exc()
+            finally:
+                self.ws = None
+                if self.running:
+                    # krótki delay przed ponowną próbą
+                    await asyncio.sleep(1)
+        print("DataReceiver.run() zakończone.")
 
     async def close_connection(self):
-        # Można zaimplementować zamykanie połączenia, jeśli potrzebne
-        pass
+        """Zatrzymuje pętlę i wysyła close frame (kod 1000)."""
+        self.running = False
+        if self.ws:
+            try:
+                await self.ws.close(code=default_close_code, reason="Client exit")
+                print("Wysłano poprawny close frame.")
+            except Exception as e:
+                print("Błąd przy zamykaniu ws:", e)
 
-
-# Główne okno aplikacji
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Monitor danych ESP32")
-# Bufory danych
+
+        # Bufory danych i wykresy
         self.time_data = []
-        self.voltage1_data = []
-        self.voltage2_data = []
-        self.voltage3_data = []
-        self.current1_data = []
-        self.current2_data = []
-        self.current3_data = []
+        self.voltage1_data, self.voltage2_data, self.voltage3_data = [], [], []
+        self.current1_data, self.current2_data, self.current3_data = [], [], []
         self.temp_data = []
         self.start_time = time.time()
 
-        # Tworzymy wykresy dla napięć
-        self.voltage1_plot = pg.PlotWidget(title="Voltage 1")
-        self.voltage2_plot = pg.PlotWidget(title="Voltage 2")
-        self.voltage3_plot = pg.PlotWidget(title="Voltage 3")
-        # Tworzymy wykresy dla prądów
-        self.current1_plot = pg.PlotWidget(title="Current 1")
-        self.current2_plot = pg.PlotWidget(title="Current 2")
-        self.current3_plot = pg.PlotWidget(title="Current 3")
-        # Wykres dla temperatury
-        self.temp_plot = pg.PlotWidget(title="Temperature")
+        plots = []
+        for label in ("Voltage 1", "Voltage 2", "Voltage 3", "Current 1", "Current 2", "Current 3", "Temperature"):
+            pw = pg.PlotWidget(title=label)
+            pw.setBackground('#2b2b2b')
+            for ax in ('left', 'bottom'):
+                pw.getAxis(ax).setPen('w')
+                pw.getAxis(ax).setTextPen('w')
+            plots.append(pw)
 
-        # Ustawienia wykresów - ciemne tło, jasne osie
-        for plot in (self.voltage1_plot, self.voltage2_plot, self.voltage3_plot,
-                     self.current1_plot, self.current2_plot, self.current3_plot,
-                     self.temp_plot):
-            plot.setBackground('#2b2b2b')
-            plot.getAxis('left').setPen('w')
-            plot.getAxis('bottom').setPen('w')
-            plot.getAxis('left').setTextPen('w')
-            plot.getAxis('bottom').setTextPen('w')
+        self.voltage1_curve, self.voltage2_curve, self.voltage3_curve = [plots[i].plot() for i in range(3)]
+        self.current1_curve, self.current2_curve, self.current3_curve = [plots[i].plot() for i in range(3,6)]
+        self.temp_curve = plots[6].plot()
 
-        # Krzywe dla wykresów
-        self.voltage1_curve = self.voltage1_plot.plot(pen='r')
-        self.voltage2_curve = self.voltage2_plot.plot(pen='r')
-        self.voltage3_curve = self.voltage3_plot.plot(pen='r')
-
-        self.current1_curve = self.current1_plot.plot(pen='y')
-        self.current2_curve = self.current2_plot.plot(pen='y')
-        self.current3_curve = self.current3_plot.plot(pen='y')
-
-        self.temp_curve = self.temp_plot.plot(pen='c')
-
-        # Grupa sterowania napięciem - przykładowa kontrolka do wysłania komendy SET_VOLTAGE
+        # Sterowanie
         self.voltageLineEdit = QtWidgets.QLineEdit()
         self.setVoltageButton = QtWidgets.QPushButton("Ustaw napięcie")
-
         controlGroup = QtWidgets.QGroupBox("Sterowanie")
-        controlLayout = QtWidgets.QVBoxLayout()
-        controlLayout.addWidget(QtWidgets.QLabel("Podaj napięcie:"))
-        controlLayout.addWidget(self.voltageLineEdit)
-        controlLayout.addWidget(self.setVoltageButton)
-        controlGroup.setLayout(controlLayout)
+        cg_layout = QtWidgets.QVBoxLayout(controlGroup)
+        cg_layout.addWidget(QtWidgets.QLabel("Podaj napięcie:"))
+        cg_layout.addWidget(self.voltageLineEdit)
+        cg_layout.addWidget(self.setVoltageButton)
 
-        # Układ kolumnowy:
-        # Lewa kolumna – wykresy napięć (voltage1, voltage2, voltage3) ułożone pionowo
-        leftLayout = QtWidgets.QVBoxLayout()
-        leftLayout.addWidget(self.voltage1_plot)
-        leftLayout.addWidget(self.voltage2_plot)
-        leftLayout.addWidget(self.voltage3_plot)
+        left = QtWidgets.QVBoxLayout(); [left.addWidget(p) for p in plots[:3]]
+        center = QtWidgets.QVBoxLayout(); [center.addWidget(p) for p in plots[3:6]]
+        right = QtWidgets.QVBoxLayout(); right.addWidget(plots[6]); right.addWidget(controlGroup); right.addStretch()
 
-        # Środkowa kolumna – wykresy prądów (current1, current2, current3)
-        centerLayout = QtWidgets.QVBoxLayout()
-        centerLayout.addWidget(self.current1_plot)
-        centerLayout.addWidget(self.current2_plot)
-        centerLayout.addWidget(self.current3_plot)
-
-        # Prawa kolumna – wykres temperatury i sterowanie napięciem
-        rightLayout = QtWidgets.QVBoxLayout()
-        rightLayout.addWidget(self.temp_plot)
-        rightLayout.addWidget(controlGroup)
-        rightLayout.addStretch()
-
-        # Łączymy trzy kolumny
-        mainLayout = QtWidgets.QHBoxLayout()
-        mainLayout.addLayout(leftLayout, stretch=1)
-        mainLayout.addLayout(centerLayout, stretch=1)
-        mainLayout.addLayout(rightLayout, stretch=1)
-
+        main_layout = QtWidgets.QHBoxLayout()
+        main_layout.addLayout(left, 1)
+        main_layout.addLayout(center, 1)
+        main_layout.addLayout(right, 1)
         container = QtWidgets.QWidget()
-        container.setLayout(mainLayout)
+        container.setLayout(main_layout)
         self.setCentralWidget(container)
 
-        # Ustaw globalny ciemny motyw
         self.setStyleSheet("""
-            QWidget {
-                background-color: #2b2b2b;
-                color: #ffffff;
-                font-size: 14px;
-            }
-            QLineEdit, QPushButton {
-                background-color: #3c3f41;
-                border: 1px solid #5c5c5c;
-                padding: 5px;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #4b4f51;
-            }
-            QGroupBox {
-                font-weight: bold;
-                border: 1px solid #5c5c5c;
-                border-radius: 6px;
-                margin-top: 10px;
-                padding: 10px;
-            }
+            QWidget { background-color: #2b2b2b; color: #fff; font-size:14px }
+            QLineEdit, QPushButton { background:#3c3f41; border:1px solid #5c5c5c; padding:5px; border-radius:4px }
+            QPushButton:hover { background:#4b4f51 }
+            QGroupBox { border:1px solid #5c5c5c; border-radius:6px; padding:10px; margin-top:10px; font-weight:bold }
         """)
 
-        # Połączenie przycisku sterowania z akcją
+        # Sygnały i połączenia
         self.setVoltageButton.clicked.connect(self.sendVoltageCommand)
-
-        # Tworzymy obiekt odbierający dane z WebSocket
         self.dataReceiver = DataReceiver()
         self.dataReceiver.dataReceived.connect(self.updateData)
-
-        # Odroczenie uruchomienia połączenia WebSocket
         QtCore.QTimer.singleShot(0, self.start_websocket_connection)
 
     def start_websocket_connection(self):
-        uri = "ws://192.168.18.229/ws"  # Zamień na właściwy adres Twojego ESP32
-        print("Uruchamiam połączenie z WebSocket...")
-        asyncio.ensure_future(self.dataReceiver.run(uri))
+        uri = "ws://192.168.87.229/ws"
+        asyncio.create_task(self.dataReceiver.run(uri))
 
     def updateData(self, data):
-        # Odczyt danych
-        voltage1 = data.get("Voltage1", 0)
-        voltage2 = data.get("Voltage2", 0)
-        voltage3 = data.get("Voltage3", 0)
-        current1 = data.get("Current1", 0)
-        current2 = data.get("Current2", 0)
-        current3 = data.get("Current3", 0)
-        temp = data.get("Temperature", 0)
+        t = time.time() - self.start_time
+        self.time_data.append(t)
+        for key, arr in zip(("Voltage1","Voltage2","Voltage3","Current1","Current2","Current3","Temperature"),
+                            (self.voltage1_data,self.voltage2_data,self.voltage3_data,
+                             self.current1_data,self.current2_data,self.current3_data,self.temp_data)):
+            arr.append(data.get(key, 0))
 
-        # Aktualizacja etykiet (opcjonalnie, możesz dodać osobne etykiety)
-        # Aktualizacja wykresów
-        current_time = time.time() - self.start_time
-        # Aktualizacja list czasowych
-        self.time_data.append(current_time)
-        # Aktualizacja list danych - osobno dla każdego kanału
-        self.voltage1_data.append(voltage1)
-        self.voltage2_data.append(voltage2)
-        self.voltage3_data.append(voltage3)
-
-        self.current1_data.append(current1)
-        self.current2_data.append(current2)
-        self.current3_data.append(current3)
-
-        self.temp_data.append(temp)
-
-        # Ograniczenie liczby punktów do ostatnich 100
         max_points = 100
-        if len(self.time_data) > max_points:
-            self.time_data = self.time_data[-max_points:]
-            self.voltage1_data = self.voltage1_data[-max_points:]
-            self.voltage2_data = self.voltage2_data[-max_points:]
-            self.voltage3_data = self.voltage3_data[-max_points:]
-            self.current1_data = self.current1_data[-max_points:]
-            self.current2_data = self.current2_data[-max_points:]
-            self.current3_data = self.current3_data[-max_points:]
-            self.temp_data = self.temp_data[-max_points:]
+        for arr in (self.time_data, self.voltage1_data, self.voltage2_data, self.voltage3_data,
+                    self.current1_data, self.current2_data, self.current3_data, self.temp_data):
+            if len(arr) > max_points:
+                del arr[:-max_points]
 
-        # Aktualizacja krzywych wykresów
+        # Aktualizacja wykresów
         self.voltage1_curve.setData(self.time_data, self.voltage1_data)
         self.voltage2_curve.setData(self.time_data, self.voltage2_data)
         self.voltage3_curve.setData(self.time_data, self.voltage3_data)
@@ -228,32 +170,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.temp_curve.setData(self.time_data, self.temp_data)
 
     def sendVoltageCommand(self):
-        voltage = self.voltageLineEdit.text()
-        command = f"SET_VOLTAGE:{voltage}"
-        # Logika wysłania komendy przez WebSocket do ESP32 (do zaimplementowania)
-        print(f"Wysyłam komendę: {command}")
+        cmd = f"SET_VOLTAGE:{self.voltageLineEdit.text()}"
+        print(f"Wysyłam komendę: {cmd}")
+
+    def closeEvent(self, event):
+        asyncio.create_task(self.dataReceiver.close_connection())
+        event.accept()
 
 
-# Główna funkcja aplikacji, integrująca PyQt5 z asyncio przez qasync
-async def main():
+def main():
     app = QtWidgets.QApplication(sys.argv)
-    app.setStyleSheet(""" 
-        QWidget {
-            background-color: #2b2b2b;
-            color: #ffffff;
-            font-size: 14px;
-        }
-        QLineEdit, QPushButton {
-            background-color: #3c3f41;
-            border: 1px solid #5c5c5c;
-            padding: 5px;
-            border-radius: 4px;
-        }
-        QPushButton:hover {
-            background-color: #4b4f51;
-        }
-    """)
-
     loop = qasync.QEventLoop(app)
     asyncio.set_event_loop(loop)
 
@@ -263,6 +189,5 @@ async def main():
     with loop:
         loop.run_forever()
 
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

@@ -63,6 +63,10 @@ void sendData() {
 void setup() {
     Serial.begin(115200);
 
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();   // upewnij się, że ESP nie jest już „podłączone” do czegokolwiek
+    delay(100);
+
 
     WiFi.begin(ssid, password);
     while (WiFi.status() != WL_CONNECTED) {
@@ -83,5 +87,5 @@ void setup() {
 
 void loop() {
     sendData();
-    delay(100);
+    delay(300);
 }
